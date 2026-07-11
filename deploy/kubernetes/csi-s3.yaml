@@ -8,6 +8,15 @@ kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: csi-s3
+rules:
+  # COSI-handle mode: resolve the BucketAccess → BucketClaim (gate on readiness)
+  # → credentials Secret at NodeStage.
+  - apiGroups: ["objectstorage.k8s.io"]
+    resources: ["bucketaccesses", "bucketclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
@@ -37,15 +46,22 @@ spec:
         app: csi-s3
     spec:
       tolerations:
+        # CSI node plugin: must run on EVERY node — a bucket may be mounted
+        # anywhere (control-plane, tainted/reserved nodes included). Without
+        # the blanket NoSchedule toleration the DaemonSet skips tainted nodes.
+        - operator: Exists
+          effect: NoSchedule
         - key: CriticalAddonsOnly
           operator: Exists
         - operator: Exists
           effect: NoExecute
           tolerationSeconds: 300
       serviceAccount: csi-s3
+      imagePullSecrets:
+        - name: lazedo-ghcr
       containers:
         - name: driver-registrar
-          image: cr.yandex/crp9ftr22d26age3hulg/yandex-cloud/csi-s3/csi-node-driver-registrar:v2.16.0
+          image: ghcr.io/lazedo/csi-node-driver-registrar:v2.16.0
           args:
             - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
             - "--v=4"
@@ -54,7 +70,7 @@ spec:
             - name: ADDRESS
               value: /csi/csi.sock
             - name: DRIVER_REG_SOCK_PATH
-              value: /var/lib/kubelet/plugins/ru.yandex.s3.csi/csi.sock
+              value: /var/lib/kubelet/plugins/csi.lazedo.dev/csi.sock
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -70,7 +86,7 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: cr.yandex/crp9ftr22d26age3hulg/csi-s3:0.43.7
+          image: ghcr.io/lazedo/csi-s3:0.44.0-lazedo6
           imagePullPolicy: IfNotPresent
           args:
             - "--endpoint=$(CSI_ENDPOINT)"
@@ -103,7 +119,7 @@ spec:
             type: DirectoryOrCreate
         - name: plugin-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/ru.yandex.s3.csi
+            path: /var/lib/kubelet/plugins/csi.lazedo.dev
             type: DirectoryOrCreate
         - name: stage-dir
           hostPath:

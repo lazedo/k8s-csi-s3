@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -33,6 +35,27 @@ type Config struct {
 	Endpoint        string
 	Mounter         string
 	Insecure        bool
+	// CABundle is a PEM bundle to verify the endpoint's TLS certificate against
+	// (private CAs), instead of disabling verification with Insecure.
+	CABundle string
+	// Bucket, when set, is a COSI-provided EXISTING bucket (from a BucketAccess
+	// credentials Secret): volumes mount its root, the driver never creates nor
+	// deletes it — that lifecycle belongs to the BucketClaim.
+	Bucket string
+}
+
+// cosiBucketInfo mirrors the COSI (v1alpha1 / release-0.2) BucketAccess
+// credentials Secret payload: key "BucketInfo" holds this JSON document.
+type cosiBucketInfo struct {
+	Spec struct {
+		BucketName string `json:"bucketName"`
+		SecretS3   struct {
+			Endpoint        string `json:"endpoint"`
+			Region          string `json:"region"`
+			AccessKeyID     string `json:"accessKeyID"`
+			AccessSecretKey string `json:"accessSecretKey"`
+		} `json:"secretS3"`
+	} `json:"spec"`
 }
 
 type FSMeta struct {
@@ -62,6 +85,12 @@ func NewClient(cfg *Config) (*s3Client, error) {
 		tlsConfig := &tls.Config{}
 		tlsConfig.InsecureSkipVerify = true
 		transport.TLSClientConfig = tlsConfig
+	} else if client.Config.CABundle != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(client.Config.CABundle)) {
+			return nil, fmt.Errorf("caBundle contains no valid PEM certificates")
+		}
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
 	minioClient, err := minio.New(endpoint, &minio.Options{
 		Transport: transport,
@@ -79,6 +108,28 @@ func NewClient(cfg *Config) (*s3Client, error) {
 
 func NewClientFromSecret(secret map[string]string) (*s3Client, error) {
 	insecure, _ := strconv.ParseBool(secret["insecure"])
+	// COSI bridge: a BucketAccess credentials Secret carries everything in the
+	// "BucketInfo" JSON document (bucket name + endpoint + keys). caBundle and
+	// insecure stay honoured as sidecar keys for private-CA endpoints.
+	if info := secret["BucketInfo"]; info != "" {
+		var bi cosiBucketInfo
+		if err := json.Unmarshal([]byte(info), &bi); err != nil {
+			return nil, fmt.Errorf("parsing COSI BucketInfo: %w", err)
+		}
+		if bi.Spec.BucketName == "" || bi.Spec.SecretS3.Endpoint == "" {
+			return nil, fmt.Errorf("COSI BucketInfo missing bucketName or secretS3.endpoint")
+		}
+		return NewClient(&Config{
+			AccessKeyID:     bi.Spec.SecretS3.AccessKeyID,
+			SecretAccessKey: bi.Spec.SecretS3.AccessSecretKey,
+			Region:          bi.Spec.SecretS3.Region,
+			Endpoint:        bi.Spec.SecretS3.Endpoint,
+			Mounter:         "",
+			Insecure:        insecure,
+			CABundle:        secret["caBundle"],
+			Bucket:          bi.Spec.BucketName,
+		})
+	}
 	return NewClient(&Config{
 		AccessKeyID:     secret["accessKeyID"],
 		SecretAccessKey: secret["secretAccessKey"],
@@ -87,6 +138,7 @@ func NewClientFromSecret(secret map[string]string) (*s3Client, error) {
 		// Mounter is set in the volume preferences, not secrets
 		Mounter:  "",
 		Insecure: insecure,
+		CABundle: secret["caBundle"],
 	})
 }
 

@@ -39,6 +39,11 @@ type controllerServer struct {
 	driver *driver
 }
 
+// cosiBucketContextKey carries the COSI-provided bucket name in the volume
+// context so the node servers mount its root instead of deriving bucket/prefix
+// from the volume ID.
+const cosiBucketContextKey = "csi.lazedo.dev/cosi-bucket"
+
 func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	params := req.GetParameters()
 	capacityBytes := int64(req.GetCapacityRange().GetRequiredBytes())
@@ -63,24 +68,58 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 
 	glog.V(4).Infof("Got a request to create volume %s", volumeID)
 
+	// COSI-handle mode: the PVC annotation (csi.lazedo.dev/bucket-access) names a
+	// BucketAccess. With --extra-create-metadata the provisioner passes the PVC
+	// name/namespace here; we read the annotation and stamp the handle into the
+	// volume context. The COSI BucketClaim owns the bucket lifecycle, so the
+	// controller neither talks to MinIO nor holds credentials.
+	if baName, baNS, ok := cs.driver.bucketAccessHandle(ctx, params); ok {
+		volContext := map[string]string{
+			mounter.TypeKey:     params[mounter.TypeKey],
+			mounter.OptionsKey:  params[mounter.OptionsKey],
+			bucketAccessNameKey: baName,
+			bucketAccessNsKey:   baNS,
+			"capacity":          fmt.Sprintf("%v", capacityBytes),
+		}
+		return &csi.CreateVolumeResponse{Volume: &csi.Volume{
+			VolumeId: volumeID, CapacityBytes: capacityBytes, VolumeContext: volContext,
+		}}, nil
+	}
+
 	client, err := s3.NewClientFromSecret(req.GetSecrets())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
 	}
 
-	exists, err := client.BucketExists(bucketName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if bucket %s exists: %v", volumeID, err)
-	}
-
-	if !exists {
-		if err = client.CreateBucket(bucketName); err != nil {
-			return nil, fmt.Errorf("failed to create bucket %s: %v", bucketName, err)
+	cosiBucket := client.Config.Bucket
+	if cosiBucket != "" {
+		// COSI bridge: the BucketAccess Secret names an EXISTING bucket — the
+		// volume is its root (no per-PV prefix) and the driver never creates it:
+		// provisioning is the BucketClaim's job, we only verify the contract.
+		bucketName = cosiBucket
+		prefix = ""
+		exists, err := client.BucketExists(bucketName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if COSI bucket %s exists: %v", bucketName, err)
 		}
-	}
+		if !exists {
+			return nil, status.Errorf(codes.FailedPrecondition, "COSI bucket %s does not exist (is the BucketClaim bound?)", bucketName)
+		}
+	} else {
+		exists, err := client.BucketExists(bucketName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check if bucket %s exists: %v", volumeID, err)
+		}
 
-	if err = client.CreatePrefix(bucketName, prefix); err != nil {
-		return nil, fmt.Errorf("failed to create prefix %s: %v", prefix, err)
+		if !exists {
+			if err = client.CreateBucket(bucketName); err != nil {
+				return nil, fmt.Errorf("failed to create bucket %s: %v", bucketName, err)
+			}
+		}
+
+		if err = client.CreatePrefix(bucketName, prefix); err != nil {
+			return nil, fmt.Errorf("failed to create prefix %s: %v", prefix, err)
+		}
 	}
 
 	glog.V(4).Infof("create volume %s", volumeID)
@@ -91,6 +130,9 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		volContext[k] = v
 	}
 	volContext["capacity"] = fmt.Sprintf("%v", capacityBytes)
+	if cosiBucket != "" {
+		volContext[cosiBucketContextKey] = cosiBucket
+	}
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volumeID,
@@ -114,6 +156,13 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	client, err := s3.NewClientFromSecret(req.GetSecrets())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
+	}
+
+	if client.Config.Bucket != "" {
+		// COSI bridge: bucket lifecycle belongs to the BucketClaim — releasing
+		// the volume must never delete data.
+		glog.V(4).Infof("volume %s is COSI-backed (bucket %s), skipping storage deletion", volumeID, client.Config.Bucket)
+		return &csi.DeleteVolumeResponse{}, nil
 	}
 
 	var deleteErr error
@@ -150,6 +199,9 @@ func (cs *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	client, err := s3.NewClientFromSecret(req.GetSecrets())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
+	}
+	if client.Config.Bucket != "" {
+		bucketName = client.Config.Bucket
 	}
 	exists, err := client.BucketExists(bucketName)
 	if err != nil {

@@ -1,6 +1,7 @@
 package mounter
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strings"
@@ -24,6 +25,12 @@ type geesefsMounter struct {
 	region          string
 	accessKeyID     string
 	secretAccessKey string
+	// caBundle (PEM) verifies a private-CA endpoint. geesefs is aws-sdk based,
+	// so it is delivered via AWS_CA_BUNDLE pointing at a file written into the
+	// plugin dir (shared host<->container, like the copied geesefs binary).
+	caBundle     string
+	caBundleCtr  string // container-side path of the written bundle
+	caBundleHost string // host-side path (systemd unit environment)
 }
 
 func newGeeseFSMounter(meta *s3.FSMeta, cfg *s3.Config) (Mounter, error) {
@@ -33,7 +40,32 @@ func newGeeseFSMounter(meta *s3.FSMeta, cfg *s3.Config) (Mounter, error) {
 		region:          cfg.Region,
 		accessKeyID:     cfg.AccessKeyID,
 		secretAccessKey: cfg.SecretAccessKey,
+		caBundle:        cfg.CABundle,
 	}, nil
+}
+
+// writeCABundle materialises the PEM bundle into the plugin dir (visible on the
+// host for systemd-run geesefs and at /csi inside the container) and appends it
+// to the container's system trust store: geesefs builds its own http.Client over
+// a transport with a nil TLSClientConfig, which ignores AWS_CA_BUNDLE but reads
+// the system roots — and every mount is a fresh process, so the updated bundle
+// is picked up. The env vars are still exported for SDK paths that honour them.
+func (geesefs *geesefsMounter) writeCABundle() error {
+	if geesefs.caBundle == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(geesefs.caBundle))
+	name := fmt.Sprintf("ca-bundle-%x.pem", sum[:4])
+	pluginDir := os.Getenv("PLUGIN_DIR")
+	if pluginDir == "" {
+		pluginDir = "/var/lib/kubelet/plugins/csi.lazedo.dev"
+	}
+	geesefs.caBundleCtr = "/csi/" + name
+	geesefs.caBundleHost = pluginDir + "/" + name
+	if err := os.WriteFile(geesefs.caBundleCtr, []byte(geesefs.caBundle), 0644); err != nil {
+		return err
+	}
+	return TrustCABundle(geesefs.caBundle)
 }
 
 func (geesefs *geesefsMounter) CopyBinary(from, to string) error {
@@ -79,6 +111,9 @@ func (geesefs *geesefsMounter) MountDirect(target string, args []string) error {
 		"AWS_ACCESS_KEY_ID=" + geesefs.accessKeyID,
 		"AWS_SECRET_ACCESS_KEY=" + geesefs.secretAccessKey,
 	}
+	if geesefs.caBundleCtr != "" {
+		envs = append(envs, "AWS_CA_BUNDLE="+geesefs.caBundleCtr)
+	}
 	return fuseMount(target, geesefsCmd, args, envs)
 }
 
@@ -88,7 +123,23 @@ type execCmd struct {
 	UncleanIsFailure bool
 }
 
+// unitEnvironment is the environment for the systemd-run geesefs (host side):
+// credentials plus, when set, the CA bundle by its host path.
+func (geesefs *geesefsMounter) unitEnvironment() []string {
+	envs := []string{
+		"AWS_ACCESS_KEY_ID=" + geesefs.accessKeyID,
+		"AWS_SECRET_ACCESS_KEY=" + geesefs.secretAccessKey,
+	}
+	if geesefs.caBundleHost != "" {
+		envs = append(envs, "AWS_CA_BUNDLE="+geesefs.caBundleHost)
+	}
+	return envs
+}
+
 func (geesefs *geesefsMounter) Mount(target, volumeID string) error {
+	if err := geesefs.writeCABundle(); err != nil {
+		return fmt.Errorf("writing CA bundle: %v", err)
+	}
 	fullPath := fmt.Sprintf("%s:%s", geesefs.meta.BucketName, geesefs.meta.Prefix)
 	var args []string
 	if geesefs.region != "" {
@@ -151,7 +202,7 @@ func (geesefs *geesefsMounter) Mount(target, volumeID string) error {
 	}
 	pluginDir := os.Getenv("PLUGIN_DIR")
 	if pluginDir == "" {
-		pluginDir = "/var/lib/kubelet/plugins/ru.yandex.s3.csi"
+		pluginDir = "/var/lib/kubelet/plugins/csi.lazedo.dev"
 	}
 	args = append([]string{pluginDir+"/geesefs", "-f", "-o", "allow_other", "--endpoint", geesefs.endpoint}, args...)
 	glog.Info("Starting geesefs using systemd: "+strings.Join(args, " "))
@@ -164,7 +215,7 @@ func (geesefs *geesefsMounter) Mount(target, volumeID string) error {
 		systemd.PropExecStart(args, false),
 		systemd.Property{
 			Name: "Environment",
-			Value: dbus.MakeVariant([]string{ "AWS_ACCESS_KEY_ID="+geesefs.accessKeyID, "AWS_SECRET_ACCESS_KEY="+geesefs.secretAccessKey }),
+			Value: dbus.MakeVariant(geesefs.unitEnvironment()),
 		},
 		systemd.Property{
 			Name: "CollectMode",

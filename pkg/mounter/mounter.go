@@ -56,6 +56,31 @@ func New(meta *s3.FSMeta, cfg *s3.Config) (Mounter, error) {
 	}
 }
 
+// systemCABundle is the container's trust store (alpine base image).
+const systemCABundle = "/etc/ssl/certs/ca-certificates.crt"
+
+// TrustCABundle appends a PEM bundle to the container's system trust store so
+// FUSE mounters spawned in-container (geesefs with its own transport, s3fs via
+// libcurl) verify private-CA endpoints. Idempotent per bundle content.
+func TrustCABundle(pem string) error {
+	existing, err := os.ReadFile(systemCABundle)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if strings.Contains(string(existing), pem) {
+		return nil
+	}
+	f, err := os.OpenFile(systemCABundle, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteString("\n" + pem + "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func fuseMount(path string, command string, args []string, envs []string) error {
 	cmd := exec.Command(command, args...)
 	cmd.Stderr = os.Stderr

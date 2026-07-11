@@ -69,6 +69,8 @@ spec:
         app: csi-s3-provisioner
     spec:
       serviceAccount: csi-s3-provisioner-sa
+      imagePullSecrets:
+        - name: lazedo-ghcr
       tolerations:
         - key: node-role.kubernetes.io/master
           operator: Exists
@@ -76,19 +78,20 @@ spec:
           operator: Exists
       containers:
         - name: csi-provisioner
-          image: cr.yandex/crp9ftr22d26age3hulg/yandex-cloud/csi-s3/csi-provisioner:v6.2.0
+          image: ghcr.io/lazedo/csi-provisioner:v6.2.0
           args:
             - "--csi-address=$(ADDRESS)"
+            - "--extra-create-metadata=true"
             - "--v=4"
           env:
             - name: ADDRESS
-              value: /var/lib/kubelet/plugins/ru.yandex.s3.csi/csi.sock
+              value: /var/lib/kubelet/plugins/csi.lazedo.dev/csi.sock
           imagePullPolicy: "IfNotPresent"
           volumeMounts:
             - name: socket-dir
-              mountPath: /var/lib/kubelet/plugins/ru.yandex.s3.csi
+              mountPath: /var/lib/kubelet/plugins/csi.lazedo.dev
         - name: csi-s3
-          image: cr.yandex/crp9ftr22d26age3hulg/csi-s3:0.43.7
+          image: ghcr.io/lazedo/csi-s3:0.44.0-lazedo6
           imagePullPolicy: IfNotPresent
           args:
             - "--endpoint=$(CSI_ENDPOINT)"
@@ -96,14 +99,14 @@ spec:
             - "--v=4"
           env:
             - name: CSI_ENDPOINT
-              value: unix:///var/lib/kubelet/plugins/ru.yandex.s3.csi/csi.sock
+              value: unix:///var/lib/kubelet/plugins/csi.lazedo.dev/csi.sock
             - name: NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
           volumeMounts:
             - name: socket-dir
-              mountPath: /var/lib/kubelet/plugins/ru.yandex.s3.csi
+              mountPath: /var/lib/kubelet/plugins/csi.lazedo.dev
       volumes:
         - name: socket-dir
           emptyDir: {}

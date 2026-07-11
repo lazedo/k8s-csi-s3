@@ -40,6 +40,12 @@ type nodeServer struct {
 }
 
 func getMeta(bucketName, prefix string, context map[string]string) *s3.FSMeta {
+	// COSI bridge: the controller stamped the BucketAccess bucket in the volume
+	// context — mount its root, regardless of what the volume ID encodes.
+	if b := context[cosiBucketContextKey]; b != "" {
+		bucketName = b
+		prefix = ""
+	}
 	mountOptions := make([]string, 0)
 	mountOptStr := context[mounter.OptionsKey]
 	if mountOptStr != "" {
@@ -90,9 +96,18 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if notMnt {
 		// Staged mount is dead by some reason. Revive it
 		bucketName, prefix := volumeIDToBucketPrefix(volumeID)
-		s3Client, err := s3.NewClientFromSecret(req.GetSecrets())
+		secrets, err := ns.driver.secretsForVolume(ctx, req.GetSecrets(), req.VolumeContext)
+		if err != nil {
+			return nil, err
+		}
+		s3Client, err := s3.NewClientFromSecret(secrets)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
+		}
+		// COSI bridge: the BucketAccess secret names the bucket; mount its root
+		// regardless of the volume ID.
+		if s3Client.Config.Bucket != "" {
+			bucketName, prefix = s3Client.Config.Bucket, ""
 		}
 		meta := getMeta(bucketName, prefix, req.VolumeContext)
 		m, err := mounter.New(meta, s3Client.Config)
@@ -178,9 +193,17 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if !notMnt {
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
-	client, err := s3.NewClientFromSecret(req.GetSecrets())
+	secrets, err := ns.driver.secretsForVolume(ctx, req.GetSecrets(), req.VolumeContext)
+	if err != nil {
+		return nil, err
+	}
+	client, err := s3.NewClientFromSecret(secrets)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
+	}
+	// COSI bridge: mount the BucketAccess-named bucket's root.
+	if client.Config.Bucket != "" {
+		bucketName, prefix = client.Config.Bucket, ""
 	}
 
 	meta := getMeta(bucketName, prefix, req.VolumeContext)

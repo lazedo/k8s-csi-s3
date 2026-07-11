@@ -22,6 +22,7 @@ import (
 	"os"
 
 	"github.com/yandex-cloud/k8s-csi-s3/pkg/driver"
+	"github.com/yandex-cloud/k8s-csi-s3/pkg/mounter"
 )
 
 func init() {
@@ -35,6 +36,19 @@ var (
 
 func main() {
 	flag.Parse()
+
+	// Trust a cluster/private CA cluster-wide when mounted (CA_BUNDLE_FILE): the
+	// COSI BucketAccess secret carries no caBundle, so private-CA endpoints are
+	// verified via the container trust store instead of per-secret.
+	if f := os.Getenv("CA_BUNDLE_FILE"); f != "" {
+		if pem, err := os.ReadFile(f); err == nil {
+			if err := mounter.TrustCABundle(string(pem)); err != nil {
+				log.Printf("warning: trusting CA_BUNDLE_FILE %s: %v", f, err)
+			}
+		} else {
+			log.Printf("warning: reading CA_BUNDLE_FILE %s: %v", f, err)
+		}
+	}
 
 	driver, err := driver.New(*nodeID, *endpoint)
 	if err != nil {

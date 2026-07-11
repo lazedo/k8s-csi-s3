@@ -35,6 +35,8 @@ type driver struct {
 	nodeID   string
 	endpoint string
 
+	k8s *k8sClients // in-cluster clients for COSI-handle resolution (nil out of cluster)
+
 	ids *identityServer
 	ns  *nodeServer
 	cs  *controllerServer
@@ -42,7 +44,7 @@ type driver struct {
 
 var (
 	vendorVersion = "v1.34.7"
-	driverName    = "ru.yandex.s3.csi"
+	driverName    = "csi.lazedo.dev"
 )
 
 // New initializes the driver
@@ -52,6 +54,12 @@ func New(nodeID string, endpoint string) (*driver, error) {
 		version:  vendorVersion,
 		nodeID:   nodeID,
 		endpoint: endpoint,
+	}
+	// best-effort in-cluster clients; only needed for COSI-handle volumes.
+	if k8s, err := newK8sClients(); err != nil {
+		glog.Warningf("no in-cluster k8s client (COSI-handle volumes unavailable): %v", err)
+	} else {
+		d.k8s = k8s
 	}
 	return d, nil
 }
