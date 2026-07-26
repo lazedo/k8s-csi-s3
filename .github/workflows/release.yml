@@ -8,6 +8,11 @@ on:
 jobs:
 
   build:
+    # lazedo fork: upstream-only. This pushes to the upstream's own registry
+    # (cr.yandex) with a secret this fork does not hold, and it fires on the
+    # same v* tags our image workflow uses. Guarding by repository leaves the
+    # file untouched for merges.
+    if: github.repository == 'yandex-cloud/k8s-csi-s3'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
