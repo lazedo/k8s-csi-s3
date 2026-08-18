@@ -61,9 +61,11 @@ type supervisor struct {
 }
 
 func newSupervisor(d *driver) *supervisor {
-	dir := os.Getenv("PLUGIN_DIR")
-	if dir == "" {
-		dir = "/var/lib/kubelet/plugins/csi.lazedo.dev"
+	// the plugin dir is bind-mounted at /csi inside the container (the host
+	// path only exists host-side); state must go through the container view.
+	dir := "/csi"
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		dir = os.TempDir()
 	}
 	interval := time.Duration(defaultSuperviseSeconds) * time.Second
 	if v := os.Getenv(superviseIntervalEnv); v != "" {
