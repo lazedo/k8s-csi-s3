@@ -36,6 +36,7 @@ type driver struct {
 	endpoint string
 
 	k8s *k8sClients // in-cluster clients for COSI-handle resolution (nil out of cluster)
+	sup *supervisor // dead-mount healer (node side)
 
 	ids *identityServer
 	ns  *nodeServer
@@ -43,7 +44,7 @@ type driver struct {
 }
 
 var (
-	vendorVersion = "v1.34.7"
+	vendorVersion = "v1.34.8"
 	driverName    = "csi.lazedo.dev"
 )
 
@@ -71,6 +72,8 @@ func (d *driver) Run() {
 	d.ids = &identityServer{driver: d}
 	d.ns = &nodeServer{driver: d}
 	d.cs = &controllerServer{driver: d}
+	d.sup = newSupervisor(d)
+	go d.sup.run(context.Background())
 
 	// Parse endpoint
 	u, err := url.Parse(d.endpoint)

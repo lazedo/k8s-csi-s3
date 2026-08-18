@@ -18,11 +18,13 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"syscall"
 
 	"github.com/golang/glog"
 	"github.com/yandex-cloud/k8s-csi-s3/pkg/mounter"
@@ -95,28 +97,10 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 	if notMnt {
 		// Staged mount is dead by some reason. Revive it
-		bucketName, prefix := volumeIDToBucketPrefix(volumeID)
-		secrets, err := ns.driver.secretsForVolume(ctx, req.GetSecrets(), req.VolumeContext)
-		if err != nil {
+		if err := ns.mountStaged(ctx, volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets()); err != nil {
 			return nil, err
 		}
-		s3Client, err := s3.NewClientFromSecret(secrets)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
-		}
-		// COSI bridge: the BucketAccess secret names the bucket; mount its root
-		// regardless of the volume ID.
-		if s3Client.Config.Bucket != "" {
-			bucketName, prefix = s3Client.Config.Bucket, ""
-		}
-		meta := getMeta(bucketName, prefix, req.VolumeContext)
-		m, err := mounter.New(meta, s3Client.Config)
-		if err != nil {
-			return nil, err
-		}
-		if err := m.Mount(stagingTargetPath, volumeID); err != nil {
-			return nil, err
-		}
+		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
 	}
 
 	notMnt, err = checkMount(targetPath)
@@ -144,6 +128,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	}
 
 	glog.V(4).Infof("s3: volume %s successfully mounted to %s", volumeID, targetPath)
+	ns.driver.sup.recordPublish(volumeID, targetPath)
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
@@ -163,6 +148,7 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	if err := mounter.Unmount(targetPath); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	ns.driver.sup.forgetPublish(volumeID, targetPath)
 	glog.V(4).Infof("s3: volume %s has been unmounted.", volumeID)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -171,7 +157,6 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	stagingTargetPath := req.GetStagingTargetPath()
-	bucketName, prefix := volumeIDToBucketPrefix(volumeID)
 
 	// Check arguments
 	if len(volumeID) == 0 {
@@ -191,31 +176,40 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	if !notMnt {
+		// already mounted — still (re)record for the supervisor (plugin restarts
+		// lose in-memory state; the state file survives, this is belt+braces).
+		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
-	secrets, err := ns.driver.secretsForVolume(ctx, req.GetSecrets(), req.VolumeContext)
-	if err != nil {
+	if err := ns.mountStaged(ctx, volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets()); err != nil {
 		return nil, err
+	}
+	ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
+	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// mountStaged mounts a volume at its staging path from its context+secrets —
+// shared by NodeStageVolume, the NodePublish revive path and the supervisor.
+func (ns *nodeServer) mountStaged(ctx context.Context, volumeID, stagingTargetPath string, volumeContext, csiSecrets map[string]string) error {
+	bucketName, prefix := volumeIDToBucketPrefix(volumeID)
+	secrets, err := ns.driver.secretsForVolume(ctx, csiSecrets, volumeContext)
+	if err != nil {
+		return err
 	}
 	client, err := s3.NewClientFromSecret(secrets)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize S3 client: %s", err)
+		return fmt.Errorf("failed to initialize S3 client: %s", err)
 	}
 	// COSI bridge: mount the BucketAccess-named bucket's root.
 	if client.Config.Bucket != "" {
 		bucketName, prefix = client.Config.Bucket, ""
 	}
-
-	meta := getMeta(bucketName, prefix, req.VolumeContext)
+	meta := getMeta(bucketName, prefix, volumeContext)
 	m, err := mounter.New(meta, client.Config)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := m.Mount(stagingTargetPath, volumeID); err != nil {
-		return nil, err
-	}
-
-	return &csi.NodeStageVolumeResponse{}, nil
+	return m.Mount(stagingTargetPath, volumeID)
 }
 
 func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
@@ -244,6 +238,7 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if !exists {
 		err = mounter.FuseUnmount(stagingTargetPath)
 	}
+	ns.driver.sup.forgetStage(volumeID)
 	glog.V(4).Infof("s3: volume %s has been unmounted from stage path %v.", volumeID, stagingTargetPath)
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -287,6 +282,12 @@ func checkMount(targetPath string) (bool, error) {
 			if err = os.MkdirAll(targetPath, 0750); err != nil {
 				return false, err
 			}
+			notMnt = true
+		} else if errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.EIO) {
+			// dead FUSE endpoint (the mounter died): detach the corpse and
+			// report "not mounted" so the caller remounts.
+			glog.Warningf("dead mount endpoint at %s — detaching", targetPath)
+			lazyUnmount(targetPath)
 			notMnt = true
 		} else {
 			return false, err
