@@ -17,6 +17,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
+  # mount supervisor: adopt pre-existing mounts by resolving their PV
+  # (volumeAttributes + nodeStageSecretRef) from the volumeHandle.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

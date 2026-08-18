@@ -27,11 +27,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/golang/glog"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -169,16 +171,165 @@ func (s *supervisor) run(ctx context.Context) {
 		return
 	}
 	glog.Infof("supervisor: checking staged mounts every %s", s.interval)
+	s.discover(ctx)
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
+	n := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if n++; n%10 == 0 {
+				s.discover(ctx) // pick up mounts staged by older plugin versions
+			}
 			s.checkAll(ctx)
 		}
 	}
+}
+
+// discover adopts mounts this plugin did not stage itself (volumes staged by
+// an older plugin version, or state lost): it scans /proc/mounts for our FUSE
+// mounts, reads the volumeHandle from kubelet's vol_data.json next to each
+// mountpoint, and resolves the mount parameters from the PV (volumeAttributes
+// + nodeStageSecretRef). Once adopted, the health loop covers them.
+func (s *supervisor) discover(ctx context.Context) {
+	staged, published := scanOwnMounts(s.driver.name)
+	if len(staged) == 0 && len(published) == 0 {
+		return
+	}
+	s.mu.Lock()
+	knownStage := map[string]bool{}
+	for _, v := range s.vols {
+		knownStage[v.StagePath] = true
+	}
+	s.mu.Unlock()
+
+	var pvs []pvInfo
+	for _, sp := range staged {
+		if knownStage[sp] {
+			continue
+		}
+		handle := volHandleFor(filepath.Dir(sp))
+		if handle == "" {
+			glog.Warningf("supervisor: no vol_data.json next to %s — cannot adopt", sp)
+			continue
+		}
+		if pvs == nil {
+			pvs = s.listPVs(ctx)
+		}
+		var info *pvInfo
+		for i := range pvs {
+			if pvs[i].handle == handle {
+				info = &pvs[i]
+				break
+			}
+		}
+		if info == nil {
+			glog.Warningf("supervisor: no PV with volumeHandle %s — cannot adopt %s", handle, sp)
+			continue
+		}
+		secrets := map[string]string{}
+		if info.secretName != "" && s.driver.k8s != nil {
+			sec, err := s.driver.k8s.typed.CoreV1().Secrets(info.secretNS).Get(ctx, info.secretName, metav1.GetOptions{})
+			if err != nil {
+				glog.Warningf("supervisor: stage secret %s/%s for %s: %v", info.secretNS, info.secretName, handle, err)
+				continue
+			}
+			for k, v := range sec.Data {
+				secrets[k] = string(v)
+			}
+		}
+		glog.Infof("supervisor: adopted pre-existing mount %s (volume %s)", sp, handle)
+		s.recordStage(handle, sp, info.attributes, secrets)
+	}
+
+	// publish targets: kubelet pod dirs whose vol_data.json names a handle we track.
+	s.mu.Lock()
+	byHandle := map[string]bool{}
+	for id := range s.vols {
+		byHandle[id] = true
+	}
+	s.mu.Unlock()
+	for _, pp := range published {
+		handle := volHandleFor(filepath.Dir(pp))
+		if handle == "" || !byHandle[handle] {
+			continue
+		}
+		s.recordPublish(handle, pp)
+	}
+}
+
+type pvInfo struct {
+	handle     string
+	attributes map[string]string
+	secretName string
+	secretNS   string
+}
+
+func (s *supervisor) listPVs(ctx context.Context) []pvInfo {
+	if s.driver.k8s == nil {
+		return nil
+	}
+	list, err := s.driver.k8s.typed.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		glog.Warningf("supervisor: listing PVs: %v", err)
+		return nil
+	}
+	var out []pvInfo
+	for i := range list.Items {
+		csi := list.Items[i].Spec.CSI
+		if csi == nil || csi.Driver != s.driver.name {
+			continue
+		}
+		info := pvInfo{handle: csi.VolumeHandle, attributes: csi.VolumeAttributes}
+		if ref := csi.NodeStageSecretRef; ref != nil {
+			info.secretName, info.secretNS = ref.Name, ref.Namespace
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// scanOwnMounts returns this driver's FUSE mountpoints from /proc/mounts,
+// split into staging (…/plugins/kubernetes.io/csi/<driver>/…/globalmount)
+// and publish (…/pods/…/volumes/kubernetes.io~csi/…/mount) paths. Dead
+// endpoints are still listed in /proc/mounts, which is the point.
+func scanOwnMounts(driverName string) (staged, published []string) {
+	b, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, nil
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || !strings.HasPrefix(f[2], "fuse") {
+			continue
+		}
+		mp := f[1]
+		switch {
+		case strings.Contains(mp, "/plugins/kubernetes.io/csi/"+driverName+"/") && strings.HasSuffix(mp, "/globalmount"):
+			staged = append(staged, mp)
+		case strings.Contains(mp, "/volumes/kubernetes.io~csi/") && strings.HasSuffix(mp, "/mount"):
+			published = append(published, mp)
+		}
+	}
+	return staged, published
+}
+
+// volHandleFor reads kubelet's vol_data.json in dir.
+func volHandleFor(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "vol_data.json"))
+	if err != nil {
+		return ""
+	}
+	var v struct {
+		VolumeHandle string `json:"volumeHandle"`
+		DriverName   string `json:"driverName"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return ""
+	}
+	return v.VolumeHandle
 }
 
 func (s *supervisor) checkAll(ctx context.Context) {
