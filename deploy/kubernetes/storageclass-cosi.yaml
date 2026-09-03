@@ -1,0 +1,27 @@
+---
+# COSI-mode StorageClass: one bucket per PVC, credentials taken from the
+# BucketAccess secret named by the PVC annotation csi.lazedo.dev/bucket-access
+# (in the PVC's own namespace). This is the contract the kazoo-operator relies
+# on for its config-store / whitelabel PVCs (the "csi-s3-cosi" name is fixed
+# there), so it ships with the install manifests. The single-secret variant
+# stays in examples/storageclass.yaml.
+# file-mode 0777: S3 keeps no exec bit and the config trees carry scripts the
+# kamailio wrapper runs directly (db_scripts/*.sh); geesefs applies one mode to
+# every file, so it has to include x. The mounts are read-only anyway.
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: csi-s3-cosi
+provisioner: csi.lazedo.dev
+reclaimPolicy: Retain
+parameters:
+  mounter: geesefs
+  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777"
+  csi.storage.k8s.io/provisioner-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
+  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/controller-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
+  csi.storage.k8s.io/controller-publish-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-stage-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
+  csi.storage.k8s.io/node-stage-secret-namespace: ${pvc.namespace}
+  csi.storage.k8s.io/node-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
+  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}

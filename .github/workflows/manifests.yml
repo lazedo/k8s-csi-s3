@@ -58,7 +58,7 @@ jobs:
           set -euo pipefail
           SHORT="${{ steps.sha.outputs.short }}"
           mkdir -p /tmp/manifests
-          for f in csi-s3.yaml driver.yaml provisioner.yaml; do
+          for f in csi-s3.yaml driver.yaml provisioner.yaml storageclass-cosi.yaml; do
             sed -E "s#(image: ghcr\.io/lazedo/csi-s3):[^[:space:]]+#\\1:${SHORT}#" "deploy/kubernetes/${f}" > "/tmp/manifests/${f}"
           done
           grep -q "csi-s3:${SHORT}" /tmp/manifests/csi-s3.yaml
