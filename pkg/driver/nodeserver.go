@@ -185,7 +185,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, err
 	}
 	ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
-	ns.driver.sup.warm(volumeID)
+	ns.driver.sup.warmIfOptedIn(volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 

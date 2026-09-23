@@ -408,7 +408,7 @@ func (s *supervisor) heal(ctx context.Context, v *stagedVolume) {
 		glog.Errorf("supervisor: remount of %s (volume %s) failed: %v", v.StagePath, v.VolumeID, err)
 		return
 	}
-	s.warm(v.VolumeID)
+	s.warmIfOptedIn(v.VolumeID)
 	for _, t := range v.Publishes {
 		cmd := exec.Command("mount", "--bind", v.StagePath, t)
 		if out, err := cmd.CombinedOutput(); err != nil {

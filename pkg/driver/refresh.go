@@ -113,12 +113,25 @@ func invalidate(path string) error {
 	return unix.Setxattr(path, refreshAttr, []byte{}, 0)
 }
 
-// warm starts the walk of a staged volume that asked for it, replacing a
-// walk still running.
+// warmIfOptedIn walks only when the volume asked for it with --warm-up: the
+// pre-walk at stage/heal is an opt-in cost. A refresh always re-warms (warm),
+// because dropping the cache without re-warming is strictly worse than not
+// refreshing — it reintroduces the cold-listing latency the mount exists to
+// avoid.
+func (s *supervisor) warmIfOptedIn(volumeID string) {
+	s.mu.Lock()
+	opted := s.vols[volumeID] != nil && s.vols[volumeID].WarmUp
+	s.mu.Unlock()
+	if opted {
+		s.warm(volumeID)
+	}
+}
+
+// warm starts the tree walk of a staged volume, replacing a walk still running.
 func (s *supervisor) warm(volumeID string) {
 	s.mu.Lock()
 	v := s.vols[volumeID]
-	if v == nil || !v.WarmUp {
+	if v == nil {
 		s.mu.Unlock()
 		return
 	}
