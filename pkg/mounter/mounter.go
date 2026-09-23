@@ -31,6 +31,11 @@ const (
 	TypeKey            = "mounter"
 	BucketKey          = "bucket"
 	OptionsKey         = "options"
+	// WarmUpOption is a DRIVER option in the options string (never passed to
+	// the mounter): the node plugin lists the whole tree after the stage
+	// mount, so a mount that keeps its metadata for life never serves a
+	// cold listing to a pod. See pkg/driver/refresh.go.
+	WarmUpOption = "--warm-up"
 )
 
 // New returns a new mounter depending on the mounterType parameter

@@ -156,6 +156,8 @@ func (geesefs *geesefsMounter) Mount(target, volumeID string) error {
 		opt := geesefs.meta.MountOptions[i]
 		if opt == "--no-systemd" {
 			useSystemd = false
+		} else if opt == WarmUpOption {
+			continue // the driver's, not geesefs's
 		} else if len(opt) > 0 && opt[0] == '-' {
 			// Remove unsafe options
 			s := 1

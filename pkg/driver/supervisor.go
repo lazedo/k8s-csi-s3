@@ -50,6 +50,10 @@ type stagedVolume struct {
 	// volumes, which re-resolve in-cluster). The state file is 0600.
 	Secrets   map[string]string `json:"secrets,omitempty"`
 	Publishes []string          `json:"publishes,omitempty"`
+	// WarmUp: the mount options asked for the tree walk (refresh.go).
+	WarmUp bool `json:"warmUp,omitempty"`
+	// RefreshedAt is the last refresh request answered (the PVC annotation).
+	RefreshedAt string `json:"refreshedAt,omitempty"`
 }
 
 type supervisor struct {
@@ -58,6 +62,10 @@ type supervisor struct {
 	stateFile string
 	interval  time.Duration
 	vols      map[string]*stagedVolume
+	// warming: the running warm-up walk of a volume (refresh.go).
+	warming map[string]context.CancelFunc
+	// pvHandles caches PV name → volumeHandle for the refresh watch.
+	pvHandles map[string]string
 }
 
 func newSupervisor(d *driver) *supervisor {
@@ -78,6 +86,8 @@ func newSupervisor(d *driver) *supervisor {
 		stateFile: filepath.Join(dir, stateFileName),
 		interval:  interval,
 		vols:      map[string]*stagedVolume{},
+		warming:   map[string]context.CancelFunc{},
+		pvHandles: map[string]string{},
 	}
 	s.load()
 	return s
@@ -117,15 +127,18 @@ func (s *supervisor) recordStage(volumeID, stagePath string, volumeContext, secr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev := s.vols[volumeID]
-	v := &stagedVolume{VolumeID: volumeID, StagePath: stagePath, VolumeContext: volumeContext, Secrets: secrets}
+	v := &stagedVolume{VolumeID: volumeID, StagePath: stagePath, VolumeContext: volumeContext, Secrets: secrets,
+		WarmUp: wantsWarmUp(volumeContext)}
 	if prev != nil {
 		v.Publishes = prev.Publishes
+		v.RefreshedAt = prev.RefreshedAt
 	}
 	s.vols[volumeID] = v
 	s.persist()
 }
 
 func (s *supervisor) forgetStage(volumeID string) {
+	s.stopWarm(volumeID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.vols, volumeID)
@@ -174,6 +187,7 @@ func (s *supervisor) run(ctx context.Context) {
 	}
 	glog.Infof("supervisor: checking staged mounts every %s", s.interval)
 	s.discover(ctx)
+	go s.watchRefreshRequests(ctx)
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
 	n := 0
@@ -389,10 +403,12 @@ func (s *supervisor) heal(ctx context.Context, v *stagedVolume) {
 	}
 	lazyUnmount(v.StagePath)
 
+	s.stopWarm(v.VolumeID)
 	if err := s.driver.ns.mountStaged(ctx, v.VolumeID, v.StagePath, v.VolumeContext, v.Secrets); err != nil {
 		glog.Errorf("supervisor: remount of %s (volume %s) failed: %v", v.StagePath, v.VolumeID, err)
 		return
 	}
+	s.warm(v.VolumeID)
 	for _, t := range v.Publishes {
 		cmd := exec.Command("mount", "--bind", v.StagePath, t)
 		if out, err := cmd.CombinedOutput(); err != nil {

@@ -22,6 +22,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list"]
+  # metadata refresh: a new csi.lazedo.dev/refresh-at on a PVC drops and
+  # re-warms the cache of its volume's mounts on this node (pkg/driver/refresh.go).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

@@ -43,7 +43,10 @@ provisioner: csi.lazedo.dev
 reclaimPolicy: Retain
 parameters:
   mounter: geesefs
-  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777 --stat-cache-ttl 87600h --list-type 2"
+  # --warm-up is the driver's: the whole tree listed right after the mount,
+  # so no pod ever pays a cold listing; a new csi.lazedo.dev/refresh-at on
+  # the PVC drops the cache and warms it again (content written later).
+  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777 --stat-cache-ttl 87600h --list-type 2 --warm-up"
   csi.storage.k8s.io/provisioner-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
   csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
   csi.storage.k8s.io/controller-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
