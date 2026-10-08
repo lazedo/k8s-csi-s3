@@ -74,6 +74,24 @@ func TestListenRefused(t *testing.T) {
 	}
 }
 
+// A server that never answers -- not even the headers, what MinIO's stream
+// did while its writer swallowed the flushes -- is a dead connection too.
+func TestListenNoAnswer(t *testing.T) {
+	defer func(d time.Duration) { listenIdle = d }(listenIdle)
+	listenIdle = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	connected := false
+	start := time.Now()
+	err := listenClient(t, srv).Listen(context.Background(), "bucket", "", func() { connected = true }, func(string) {})
+	if err == nil || connected || time.Since(start) > 5*time.Second {
+		t.Fatalf("no answer: err %v, connected %v, after %s", err, connected, time.Since(start))
+	}
+}
+
 // A stream with no ping for listenIdle is gone; the end of ctx is no error.
 func TestListenIdleAndCancel(t *testing.T) {
 	defer func(d time.Duration) { listenIdle = d }(listenIdle)

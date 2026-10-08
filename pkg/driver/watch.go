@@ -22,9 +22,11 @@ package driver
 //
 // A connection that starts — the first, or any after a break — drops the
 // whole cache first: what changed while nobody was listening was never
-// heard. An endpoint that refuses to be listened to (not MinIO, or
-// credentials without the permission) gets its cache dropped every
-// refusedRefresh instead, what a --stat-cache-ttl that short would do.
+// heard. While no connection holds — the endpoint refuses (not MinIO, or
+// credentials without the permission) or does not answer — the cache is
+// dropped every refusedRefresh instead, what a --stat-cache-ttl that short
+// would do: a mount whose bucket is not heard never keeps its listings for
+// good.
 
 import (
 	"context"
@@ -50,8 +52,8 @@ const (
 	// reconnectMin and reconnectMax bound the wait between connections.
 	reconnectMin = time.Second
 	reconnectMax = 30 * time.Second
-	// refusedRefresh and refusedRetry: the fallback of a bucket that cannot
-	// be listened to, and how often listening is tried again.
+	// refusedRefresh: how often the cache is dropped while the bucket is not
+	// heard; refusedRetry: how often a refusing endpoint is tried again.
 	refusedRefresh = time.Minute
 	refusedRetry   = 5 * time.Minute
 )
@@ -148,12 +150,13 @@ func (w *watch) run(volumeContext, secrets map[string]string) {
 	}
 
 	delay = reconnectMin
-	refused := false
+	deaf := false         // no connection holds: the cache is dropped every refusedRefresh
+	var dropped time.Time // the last of those drops
 	for {
 		var connectedAt time.Time
 		err := w.client.Listen(w.ctx, w.bucket, w.prefix, func() {
 			connectedAt = time.Now()
-			refused = false
+			deaf = false
 			glog.Infof("watch: volume %s: listening to %s/%s", w.volumeID, w.bucket, w.prefix)
 			w.dropAll()
 		}, w.changed)
@@ -161,21 +164,28 @@ func (w *watch) run(volumeContext, secrets map[string]string) {
 			return
 		}
 		var r *s3.ListenRefused
-		if errors.As(err, &r) {
-			if !refused {
-				glog.Warningf("watch: volume %s: %v — its cache is dropped every %s instead", w.volumeID, err, refusedRefresh)
-				refused = true
+		refused := errors.As(err, &r)
+		if !connectedAt.IsZero() && !refused {
+			// the stream broke: listen again soon; the next connection drops the cache
+			if time.Since(connectedAt) > reconnectMax {
+				delay = reconnectMin
 			}
-			if !w.dropEvery(refusedRefresh, refusedRetry) {
+			glog.Warningf("watch: volume %s: %v — listening again in %s", w.volumeID, err, delay)
+			if !sleep(w.ctx, delay) {
 				return
 			}
+			delay = min(2*delay, reconnectMax)
 			continue
 		}
-		if !connectedAt.IsZero() && time.Since(connectedAt) > reconnectMax {
-			delay = reconnectMin
+		if !deaf {
+			glog.Warningf("watch: volume %s: cannot listen: %v — its cache is dropped every %s until it can", w.volumeID, err, refusedRefresh)
+			deaf = true
 		}
-		glog.Warningf("watch: volume %s: %v — listening again in %s", w.volumeID, err, delay)
-		if !sleep(w.ctx, delay) {
+		retry := delay
+		if refused {
+			retry = refusedRetry
+		}
+		if !w.waitDropping(retry, &dropped) {
 			return
 		}
 		delay = min(2*delay, reconnectMax)
@@ -267,19 +277,27 @@ func (w *watch) dropAll() {
 	}
 }
 
-// dropEvery drops the whole cache every interval for d: the fallback of a
-// bucket that cannot be listened to. False when the watch ended.
-func (w *watch) dropEvery(interval, d time.Duration) bool {
-	for end := time.Now().Add(d); time.Now().Before(end); {
-		if !sleep(w.ctx, interval) {
+// waitDropping waits d while the bucket is not heard, dropping the whole
+// cache whenever refusedRefresh has passed since *dropped (at once the first
+// time). False when the watch ended.
+func (w *watch) waitDropping(d time.Duration, dropped *time.Time) bool {
+	end := time.Now().Add(d)
+	for {
+		if !time.Now().Before(dropped.Add(refusedRefresh)) {
+			w.sup.stopWarm(w.volumeID)
+			if err := invalidate(w.stage); err != nil {
+				glog.Errorf("watch: volume %s: dropping the cache of %s: %v", w.volumeID, w.stage, err)
+			}
+			*dropped = time.Now()
+		}
+		left := time.Until(end)
+		if left <= 0 {
+			return true
+		}
+		if !sleep(w.ctx, min(left, time.Until(dropped.Add(refusedRefresh)))) {
 			return false
 		}
-		w.sup.stopWarm(w.volumeID)
-		if err := invalidate(w.stage); err != nil {
-			glog.Errorf("watch: volume %s: dropping the cache of %s: %v", w.volumeID, w.stage, err)
-		}
 	}
-	return true
 }
 
 // outermost keeps the directories no other one contains: dropping the cache

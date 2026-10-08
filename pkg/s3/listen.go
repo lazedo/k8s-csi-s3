@@ -61,37 +61,11 @@ func (client *s3Client) Listen(ctx context.Context, bucket, prefix string, conne
 	q["events"] = []string{"s3:ObjectCreated:*", "s3:ObjectRemoved:*"}
 	u.RawQuery = s3utils.QueryEncode(q)
 
+	// The server answers with its first record, a ping at the latest: the
+	// watchdog runs from the request on, so a server that never answers is a
+	// dead connection too.
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-Amz-Content-Sha256", emptySHA256)
-	region := client.Config.Region
-	if region == "" {
-		region = "us-east-1"
-	}
-	req = signer.SignV4(*req, client.Config.AccessKeyID, client.Config.SecretAccessKey, "", region)
-
-	resp, err := (&http.Client{Transport: client.transport}).Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		text := strings.TrimSpace(string(body))
-		if resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented {
-			return fmt.Errorf("listen: HTTP %d: %s", resp.StatusCode, text) // the server's trouble, not a refusal
-		}
-		return &ListenRefused{Status: resp.StatusCode, Body: text}
-	}
-	connected()
-
 	alive := make(chan struct{}, 1)
 	go func() {
 		t := time.NewTimer(listenIdle)
@@ -108,6 +82,42 @@ func (client *s3Client) Listen(ctx context.Context, bucket, prefix string, conne
 			}
 		}
 	}()
+
+	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Amz-Content-Sha256", emptySHA256)
+	region := client.Config.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	req = signer.SignV4(*req, client.Config.AccessKeyID, client.Config.SecretAccessKey, "", region)
+
+	resp, err := (&http.Client{Transport: client.transport}).Do(req)
+	if err != nil {
+		switch {
+		case ctx.Err() != nil:
+			return nil
+		case connCtx.Err() != nil:
+			return fmt.Errorf("listen: no answer from the server in %s", listenIdle)
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		text := strings.TrimSpace(string(body))
+		if resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented {
+			return fmt.Errorf("listen: HTTP %d: %s", resp.StatusCode, text) // the server's trouble, not a refusal
+		}
+		return &ListenRefused{Status: resp.StatusCode, Body: text}
+	}
+	select {
+	case alive <- struct{}{}:
+	default:
+	}
+	connected()
 
 	dec := json.NewDecoder(resp.Body)
 	for {
