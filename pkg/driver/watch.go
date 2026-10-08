@@ -77,9 +77,11 @@ type watch struct {
 	bucket string
 	prefix string // the mount's prefix in the bucket, "" or ending in /
 
-	mu       sync.Mutex
-	pending  map[string]bool // directories, relative to the mount, that changed
-	flushing bool
+	mu        sync.Mutex
+	pending   map[string]bool // directories, relative to the mount, that changed
+	flushing  bool
+	dropping  bool // a whole-cache drop runs
+	dropAgain bool // and another was asked meanwhile
 }
 
 // startWatch (re)starts the watch of a staged volume.
@@ -264,8 +266,39 @@ func (w *watch) flush() {
 	}
 }
 
-// dropAll drops the whole cache of the mount, walking it again if read-only.
+// dropAll drops the whole cache of the mount in the background, walking it
+// again if read-only. A drop lists the root again, which takes a while on a
+// large bucket (a minute right after MinIO restarted), and the stream must be
+// read meanwhile -- a blocked reader is a dead connection to the watchdog.
+// Drops asked while one runs make one more.
 func (w *watch) dropAll() {
+	w.mu.Lock()
+	if w.dropping {
+		w.dropAgain = true
+		w.mu.Unlock()
+		return
+	}
+	w.dropping = true
+	w.mu.Unlock()
+	go func() {
+		for {
+			w.dropAllNow()
+			w.mu.Lock()
+			again := w.dropAgain
+			w.dropAgain, w.dropping = false, again
+			w.mu.Unlock()
+			if !again {
+				return
+			}
+		}
+	}()
+}
+
+// dropAllNow is a drop of the whole cache, then the walk if read-only.
+func (w *watch) dropAllNow() {
+	if w.ctx.Err() != nil {
+		return
+	}
 	w.sup.stopWarm(w.volumeID)
 	if err := invalidate(w.stage); err != nil {
 		glog.Errorf("watch: volume %s: dropping the cache of %s: %v", w.volumeID, w.stage, err)

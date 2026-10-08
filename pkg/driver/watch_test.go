@@ -1,8 +1,10 @@
 package driver
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	corev1 "k8s.io/api/core/v1"
@@ -74,5 +76,29 @@ func TestReadOnly(t *testing.T) {
 	}
 	if readOnlyModes([]corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany, corev1.ReadWriteMany}) || readOnlyModes(nil) {
 		t.Error("a writer mode, or none, is not read-only")
+	}
+}
+
+// Drops asked while one runs make one more, not one each, and the runner
+// ends once nothing more was asked.
+func TestDropAllCoalesces(t *testing.T) {
+	w := &watch{pending: map[string]bool{}}
+	w.ctx, w.cancel = context.WithCancel(context.Background())
+	w.cancel() // a drop of an ended watch does nothing: only the runner is tested
+	for range 100 {
+		w.dropAll()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		w.mu.Lock()
+		busy := w.dropping || w.dropAgain
+		w.mu.Unlock()
+		if !busy {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the drop runner never ended")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
