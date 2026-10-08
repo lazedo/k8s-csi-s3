@@ -2,51 +2,32 @@
 # COSI-mode StorageClass: one bucket per PVC, credentials taken from the
 # BucketAccess secret named by the PVC annotation csi.lazedo.dev/bucket-access
 # (in the PVC's own namespace). This is the contract the kazoo-operator relies
-# on for its config-store / whitelabel PVCs (the "csi-s3-cosi" name is fixed
+# on for its config-store, sounds and whitelabel PVCs (the "s3" name is fixed
 # there), so it ships with the install manifests. The single-secret variant
 # stays in examples/storageclass.yaml.
+#
+# One class for every bucket, changing or not. geesefs keeps what it listed
+# for ten years (--stat-cache-ttl takes a Go duration, there is no "forever"):
+# a cold directory listing costs seconds on this storage, and FreeSWITCH
+# opening a sound should never pay one. The node plugin listens to the bucket
+# of every volume it stages (MinIO's ListenBucketNotification) and drops the
+# cache of whatever is created or removed; volumes only read where they are
+# used (ReadOnlyMany) are walked again after each drop. See
+# pkg/driver/cache.go and pkg/driver/watch.go. --list-type 2: S3
+# ListObjectsV2, the listing MinIO serves best.
+#
 # file-mode 0777: S3 keeps no exec bit and the config trees carry scripts the
 # kamailio wrapper runs directly (db_scripts/*.sh); geesefs applies one mode to
-# every file, so it has to include x. The mounts are read-only anyway.
+# every file, so it has to include x.
 kind: StorageClass
 apiVersion: storage.k8s.io/v1
 metadata:
-  name: csi-s3-cosi
+  name: s3
 provisioner: csi.lazedo.dev
 reclaimPolicy: Retain
 parameters:
   mounter: geesefs
-  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777"
-  csi.storage.k8s.io/provisioner-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
-  csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/controller-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
-  csi.storage.k8s.io/controller-publish-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-stage-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
-  csi.storage.k8s.io/node-stage-secret-namespace: ${pvc.namespace}
-  csi.storage.k8s.io/node-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
-  csi.storage.k8s.io/node-publish-secret-namespace: ${pvc.namespace}
----
-# The same, for buckets whose content never changes once written — the
-# kazoo-operator's config-store and sounds buckets are one per ref, immutable
-# — with the metadata cache kept for good: geesefs forgets what it listed
-# after --stat-cache-ttl (1 minute by default) and a cold directory listing
-# costs seconds on this storage, which FreeSWITCH pays every time it opens a
-# sound. A read-only mount of an immutable bucket has nothing to invalidate,
-# so the cache lives for the life of the mount (ten years; geesefs takes a
-# Go duration, there is no "forever"). --list-type 2: S3 ListObjectsV2, the
-# listing MinIO serves best.
-kind: StorageClass
-apiVersion: storage.k8s.io/v1
-metadata:
-  name: csi-s3-cosi-immutable
-provisioner: csi.lazedo.dev
-reclaimPolicy: Retain
-parameters:
-  mounter: geesefs
-  # --warm-up is the driver's: the whole tree listed right after the mount,
-  # so no pod ever pays a cold listing; a new csi.lazedo.dev/refresh-at on
-  # the PVC drops the cache and warms it again (content written later).
-  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777 --stat-cache-ttl 87600h --list-type 2 --warm-up"
+  options: "--no-systemd --memory-limit 256 --dir-mode 0777 --file-mode 0777 --stat-cache-ttl 87600h --list-type 2"
   csi.storage.k8s.io/provisioner-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}
   csi.storage.k8s.io/provisioner-secret-namespace: ${pvc.namespace}
   csi.storage.k8s.io/controller-publish-secret-name: ${pvc.annotations['csi.lazedo.dev/bucket-access']}

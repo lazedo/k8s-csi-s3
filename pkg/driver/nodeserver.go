@@ -29,6 +29,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/yandex-cloud/k8s-csi-s3/pkg/mounter"
 	"github.com/yandex-cloud/k8s-csi-s3/pkg/s3"
+	corev1 "k8s.io/api/core/v1"
 	mount "k8s.io/mount-utils"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -100,7 +101,9 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		if err := ns.mountStaged(ctx, volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets()); err != nil {
 			return nil, err
 		}
-		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
+		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets(),
+			readOnlyCapability(req.GetVolumeCapability()))
+		ns.driver.sup.startWatch(volumeID)
 	}
 
 	notMnt, err = checkMount(targetPath)
@@ -171,6 +174,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "NodeStageVolume Volume Capability must be provided")
 	}
 
+	rewarm := readOnlyCapability(req.GetVolumeCapability())
 	notMnt, err := checkMount(stagingTargetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -178,35 +182,64 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	if !notMnt {
 		// already mounted — still (re)record for the supervisor (plugin restarts
 		// lose in-memory state; the state file survives, this is belt+braces).
-		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
+		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets(), rewarm)
+		ns.driver.sup.ensureWatch(volumeID)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 	if err := ns.mountStaged(ctx, volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets()); err != nil {
 		return nil, err
 	}
-	ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets())
-	ns.driver.sup.warmIfOptedIn(volumeID)
+	ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets(), rewarm)
+	ns.driver.sup.startWatch(volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-// mountStaged mounts a volume at its staging path from its context+secrets —
-// shared by NodeStageVolume, the NodePublish revive path and the supervisor.
-func (ns *nodeServer) mountStaged(ctx context.Context, volumeID, stagingTargetPath string, volumeContext, csiSecrets map[string]string) error {
+// readOnlyCapability says whether a volume is only read where it is used.
+func readOnlyCapability(c *csi.VolumeCapability) bool {
+	switch c.GetAccessMode().GetMode() {
+	case csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY, csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY:
+		return true
+	}
+	return false
+}
+
+// readOnlyModes is readOnlyCapability for a PV's access modes.
+func readOnlyModes(modes []corev1.PersistentVolumeAccessMode) bool {
+	for _, m := range modes {
+		if m != corev1.ReadOnlyMany {
+			return false
+		}
+	}
+	return len(modes) > 0
+}
+
+// volumeTarget resolves where a volume lives: the S3 client of its
+// credentials, and the bucket and prefix its mount shows.
+func (ns *nodeServer) volumeTarget(ctx context.Context, volumeID string, volumeContext, csiSecrets map[string]string) (*s3.Config, listener, *s3.FSMeta, error) {
 	bucketName, prefix := volumeIDToBucketPrefix(volumeID)
 	secrets, err := ns.driver.secretsForVolume(ctx, csiSecrets, volumeContext)
 	if err != nil {
-		return err
+		return nil, nil, nil, err
 	}
 	client, err := s3.NewClientFromSecret(secrets)
 	if err != nil {
-		return fmt.Errorf("failed to initialize S3 client: %s", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize S3 client: %s", err)
 	}
 	// COSI bridge: mount the BucketAccess-named bucket's root.
 	if client.Config.Bucket != "" {
 		bucketName, prefix = client.Config.Bucket, ""
 	}
-	meta := getMeta(bucketName, prefix, volumeContext)
-	m, err := mounter.New(meta, client.Config)
+	return client.Config, client, getMeta(bucketName, prefix, volumeContext), nil
+}
+
+// mountStaged mounts a volume at its staging path from its context+secrets —
+// shared by NodeStageVolume, the NodePublish revive path and the supervisor.
+func (ns *nodeServer) mountStaged(ctx context.Context, volumeID, stagingTargetPath string, volumeContext, csiSecrets map[string]string) error {
+	cfg, _, meta, err := ns.volumeTarget(ctx, volumeID, volumeContext, csiSecrets)
+	if err != nil {
+		return err
+	}
+	m, err := mounter.New(meta, cfg)
 	if err != nil {
 		return err
 	}

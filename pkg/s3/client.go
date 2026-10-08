@@ -25,6 +25,8 @@ type s3Client struct {
 	Config *Config
 	minio  *minio.Client
 	ctx    context.Context
+	// transport is the minio client's, for the requests made by hand (Listen).
+	transport *http.Transport
 }
 
 // Config holds values to configure the driver
@@ -102,6 +104,7 @@ func NewClient(cfg *Config) (*s3Client, error) {
 		return nil, err
 	}
 	client.minio = minioClient
+	client.transport = transport
 	client.ctx = context.Background()
 	return client, nil
 }

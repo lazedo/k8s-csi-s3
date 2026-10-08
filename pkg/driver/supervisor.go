@@ -50,10 +50,9 @@ type stagedVolume struct {
 	// volumes, which re-resolve in-cluster). The state file is 0600.
 	Secrets   map[string]string `json:"secrets,omitempty"`
 	Publishes []string          `json:"publishes,omitempty"`
-	// WarmUp: the mount options asked for the tree walk (refresh.go).
-	WarmUp bool `json:"warmUp,omitempty"`
-	// RefreshedAt is the last refresh request answered (the PVC annotation).
-	RefreshedAt string `json:"refreshedAt,omitempty"`
+	// Rewarm: the cache is walked again after every drop (cache.go): the
+	// volume's pods only read it (ReadOnlyMany).
+	Rewarm bool `json:"rewarm,omitempty"`
 }
 
 type supervisor struct {
@@ -62,10 +61,10 @@ type supervisor struct {
 	stateFile string
 	interval  time.Duration
 	vols      map[string]*stagedVolume
-	// warming: the running warm-up walk of a volume (refresh.go).
-	warming map[string]context.CancelFunc
-	// pvHandles caches PV name → volumeHandle for the refresh watch.
-	pvHandles map[string]string
+	// warming: the running walks of a volume (cache.go).
+	warming map[string]*warming
+	// watches: the listener of each staged volume's bucket (watch.go).
+	watches map[string]*watch
 }
 
 func newSupervisor(d *driver) *supervisor {
@@ -86,8 +85,8 @@ func newSupervisor(d *driver) *supervisor {
 		stateFile: filepath.Join(dir, stateFileName),
 		interval:  interval,
 		vols:      map[string]*stagedVolume{},
-		warming:   map[string]context.CancelFunc{},
-		pvHandles: map[string]string{},
+		warming:   map[string]*warming{},
+		watches:   map[string]*watch{},
 	}
 	s.load()
 	return s
@@ -123,21 +122,21 @@ func (s *supervisor) persist() {
 	}
 }
 
-func (s *supervisor) recordStage(volumeID, stagePath string, volumeContext, secrets map[string]string) {
+func (s *supervisor) recordStage(volumeID, stagePath string, volumeContext, secrets map[string]string, rewarm bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev := s.vols[volumeID]
 	v := &stagedVolume{VolumeID: volumeID, StagePath: stagePath, VolumeContext: volumeContext, Secrets: secrets,
-		WarmUp: wantsWarmUp(volumeContext)}
+		Rewarm: rewarm}
 	if prev != nil {
 		v.Publishes = prev.Publishes
-		v.RefreshedAt = prev.RefreshedAt
 	}
 	s.vols[volumeID] = v
 	s.persist()
 }
 
 func (s *supervisor) forgetStage(volumeID string) {
+	s.stopWatch(volumeID)
 	s.stopWarm(volumeID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -183,11 +182,12 @@ func (s *supervisor) forgetPublish(volumeID, target string) {
 func (s *supervisor) run(ctx context.Context) {
 	if s.interval <= 0 {
 		glog.Infof("supervisor: disabled (%s=0)", superviseIntervalEnv)
+		s.ensureWatches()
 		return
 	}
 	glog.Infof("supervisor: checking staged mounts every %s", s.interval)
 	s.discover(ctx)
-	go s.watchRefreshRequests(ctx)
+	s.ensureWatches()
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
 	n := 0
@@ -198,6 +198,7 @@ func (s *supervisor) run(ctx context.Context) {
 		case <-t.C:
 			if n++; n%10 == 0 {
 				s.discover(ctx) // pick up mounts staged by older plugin versions
+				s.ensureWatches()
 			}
 			s.checkAll(ctx)
 		}
@@ -257,7 +258,7 @@ func (s *supervisor) discover(ctx context.Context) {
 			}
 		}
 		glog.Infof("supervisor: adopted pre-existing mount %s (volume %s)", sp, handle)
-		s.recordStage(handle, sp, info.attributes, secrets)
+		s.recordStage(handle, sp, info.attributes, secrets, info.rewarm)
 	}
 
 	// publish targets: kubelet pod dirs whose vol_data.json names a handle we track.
@@ -281,6 +282,7 @@ type pvInfo struct {
 	attributes map[string]string
 	secretName string
 	secretNS   string
+	rewarm     bool
 }
 
 func (s *supervisor) listPVs(ctx context.Context) []pvInfo {
@@ -298,7 +300,8 @@ func (s *supervisor) listPVs(ctx context.Context) []pvInfo {
 		if csi == nil || csi.Driver != s.driver.name {
 			continue
 		}
-		info := pvInfo{handle: csi.VolumeHandle, attributes: csi.VolumeAttributes}
+		info := pvInfo{handle: csi.VolumeHandle, attributes: csi.VolumeAttributes,
+			rewarm: readOnlyModes(list.Items[i].Spec.AccessModes)}
 		if ref := csi.NodeStageSecretRef; ref != nil {
 			info.secretName, info.secretNS = ref.Name, ref.Namespace
 		}
@@ -408,7 +411,7 @@ func (s *supervisor) heal(ctx context.Context, v *stagedVolume) {
 		glog.Errorf("supervisor: remount of %s (volume %s) failed: %v", v.StagePath, v.VolumeID, err)
 		return
 	}
-	s.warmIfOptedIn(v.VolumeID)
+	s.startWatch(v.VolumeID) // a new mount: its first connection drops and walks the cache
 	for _, t := range v.Publishes {
 		cmd := exec.Command("mount", "--bind", v.StagePath, t)
 		if out, err := cmd.CombinedOutput(); err != nil {

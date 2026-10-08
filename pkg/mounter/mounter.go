@@ -31,10 +31,11 @@ const (
 	TypeKey            = "mounter"
 	BucketKey          = "bucket"
 	OptionsKey         = "options"
-	// WarmUpOption is a DRIVER option in the options string (never passed to
-	// the mounter): the node plugin lists the whole tree after the stage
-	// mount, so a mount that keeps its metadata for life never serves a
-	// cold listing to a pod. See pkg/driver/refresh.go.
+	// WarmUpOption was a driver option of the retired csi-s3-cosi-immutable
+	// StorageClass; the volumes it provisioned still carry it in their
+	// options until they are recreated, so it is dropped, never passed to the
+	// mounter. Whether a volume is walked is the driver's call now
+	// (pkg/driver/cache.go).
 	WarmUpOption = "--warm-up"
 )
 
