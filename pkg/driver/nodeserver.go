@@ -92,6 +92,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 
+	deadDev := deadMountDevice(stagingTargetPath) // checkMount detaches a dead one
 	notMnt, err := checkMount(stagingTargetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -104,6 +105,8 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets(),
 			readOnlyCapability(req.GetVolumeCapability()))
 		ns.driver.sup.startWatch(volumeID)
+		ns.driver.sup.markDead(volumeID, deadDev)
+		ns.driver.sup.graftHolders()
 	}
 
 	notMnt, err = checkMount(targetPath)
@@ -175,6 +178,7 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	rewarm := readOnlyCapability(req.GetVolumeCapability())
+	deadDev := deadMountDevice(stagingTargetPath) // checkMount detaches a dead one
 	notMnt, err := checkMount(stagingTargetPath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -191,6 +195,8 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 	ns.driver.sup.recordStage(volumeID, stagingTargetPath, req.VolumeContext, req.GetSecrets(), rewarm)
 	ns.driver.sup.startWatch(volumeID)
+	ns.driver.sup.markDead(volumeID, deadDev)
+	ns.driver.sup.graftHolders()
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 

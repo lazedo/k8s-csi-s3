@@ -61,6 +61,10 @@ spec:
         - operator: Exists
           effect: NoExecute
           tolerationSeconds: 300
+      # the node's processes in view: after a mounter dies, the supervisor
+      # grafts the healed mount into every container that still holds the
+      # dead one (pkg/driver/graft.go).
+      hostPID: true
       serviceAccount: csi-s3
       imagePullSecrets:
         - name: lazedo-ghcr

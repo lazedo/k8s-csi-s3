@@ -2,15 +2,18 @@
 // container's mount namespace — no restart. C, because setns(CLONE_NEWNS)
 // requires a single-threaded caller and the Go runtime is never that.
 //
-//   nsmount-heal <container-pid> <host-source-path> <container-target-path>
+//   nsmount-heal <container-pid> <source-path> <container-target-path> [flags]
 //
-// The caller's OWN mount namespace must already see the healthy source
-// (the healer pod bind-mounts /var/lib/kubelet with HostToContainer
-// propagation, so a freshly-remounted staging tree propagates in). We
+// flags: comma-separated per-mount flags the graft keeps from the mount it
+// replaces — ro, nosuid, nodev, noexec (a readOnly volumeMount stays
+// read-only).
+//
+// The caller's OWN mount namespace must see the healthy source: the node
+// plugin's supervisor runs it after remounting the staging path itself. We
 // open_tree(CLONE) that source into a DETACHED tree fd — which survives a
-// namespace switch — then setns into the container's mnt ns (the only
-// setns, done single-threaded here) and move_mount the clone onto the
-// dead target. Needs CAP_SYS_ADMIN (privileged + hostPID pod).
+// namespace switch — set the flags on it, then setns into the container's mnt
+// ns (the only setns, done single-threaded here) and move_mount the clone onto
+// the dead target. Needs CAP_SYS_ADMIN (privileged, hostPID to see the pid).
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +23,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mount.h>
+#include <linux/types.h>
 #include <linux/mount.h>
 
 #ifndef OPEN_TREE_CLONE
@@ -34,6 +38,30 @@
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
 #define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
 #endif
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY 0x00000001
+#endif
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#endif
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV 0x00000004
+#endif
+#ifndef MOUNT_ATTR_NOEXEC
+#define MOUNT_ATTR_NOEXEC 0x00000008
+#endif
+#ifndef MOUNT_ATTR_SIZE_VER0
+struct mount_attr {
+    __u64 attr_set;
+    __u64 attr_clr;
+    __u64 propagation;
+    __u64 userns_fd;
+};
+#define MOUNT_ATTR_SIZE_VER0 32
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
 
 static int sys_open_tree(int dfd, const char *path, unsigned int flags) {
     return syscall(SYS_open_tree, dfd, path, flags);
@@ -42,26 +70,56 @@ static int sys_move_mount(int from_dfd, const char *from, int to_dfd,
                           const char *to, unsigned int flags) {
     return syscall(SYS_move_mount, from_dfd, from, to_dfd, to, flags);
 }
+static int sys_mount_setattr(int dfd, const char *path, unsigned int flags,
+                             struct mount_attr *attr, size_t size) {
+    return syscall(SYS_mount_setattr, dfd, path, flags, attr, size);
+}
+
+// mount_flags turns "ro,nosuid,..." into MOUNT_ATTR_* bits; -1 on an unknown one.
+static long long mount_flags(const char *list) {
+    long long bits = 0;
+    char *copy = strdup(list), *save = NULL;
+    for (char *f = strtok_r(copy, ",", &save); f; f = strtok_r(NULL, ",", &save)) {
+        if (!strcmp(f, "ro")) bits |= MOUNT_ATTR_RDONLY;
+        else if (!strcmp(f, "nosuid")) bits |= MOUNT_ATTR_NOSUID;
+        else if (!strcmp(f, "nodev")) bits |= MOUNT_ATTR_NODEV;
+        else if (!strcmp(f, "noexec")) bits |= MOUNT_ATTR_NOEXEC;
+        else { free(copy); return -1; }
+    }
+    free(copy);
+    return bits;
+}
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <container-pid> <host-source-path> <container-target-path>\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s <container-pid> <source-path> <container-target-path> [ro,nosuid,nodev,noexec]\n", argv[0]);
         return 2;
     }
     const char *pid = argv[1], *src = argv[2], *target = argv[3];
+    long long bits = argc == 5 ? mount_flags(argv[4]) : 0;
+    if (bits < 0) { fprintf(stderr, "unknown flag in %s\n", argv[4]); return 2; }
 
-    // 1) clone the healthy subtree in OUR namespace (sees it via propagation).
+    // 1) clone the healthy subtree in OUR namespace.
     int tree = sys_open_tree(AT_FDCWD, src, OPEN_TREE_CLONE | AT_RECURSIVE | OPEN_TREE_CLOEXEC);
     if (tree < 0) { perror("open_tree(source)"); return 1; }
 
-    // 2) enter the container's mount namespace (single-threaded: OK here).
+    // 2) the flags of the mount it replaces, on the detached clone.
+    if (bits) {
+        struct mount_attr attr = { .attr_set = (__u64)bits };
+        if (sys_mount_setattr(tree, "", AT_EMPTY_PATH | AT_RECURSIVE, &attr, sizeof attr) < 0) {
+            perror("mount_setattr(clone)");
+            return 1;
+        }
+    }
+
+    // 3) enter the container's mount namespace (single-threaded: OK here).
     char nsp[256];
     snprintf(nsp, sizeof nsp, "/proc/%s/ns/mnt", pid);
     int nsfd = open(nsp, O_RDONLY | O_CLOEXEC);
     if (nsfd < 0) { perror("open container mnt ns"); return 1; }
     if (setns(nsfd, CLONE_NEWNS) < 0) { perror("setns(container mnt)"); return 1; }
 
-    // 3) detach the dead endpoint and graft the clone onto it.
+    // 4) detach the dead endpoint and graft the clone onto it.
     if (umount2(target, MNT_DETACH) < 0)
         perror("umount2(target) [continuing]");
     if (sys_move_mount(tree, "", AT_FDCWD, target, MOVE_MOUNT_F_EMPTY_PATH) < 0) {

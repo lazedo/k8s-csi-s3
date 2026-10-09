@@ -9,10 +9,10 @@ package driver
 // path with the same parameters NodeStageVolume used, and re-binds the
 // publish targets.
 //
-// Scope note: a container that mounted the volume with mountPropagation None
-// (the default) captured the dead superblock at start and only sees the healed
-// mount after a container restart; HostToContainer propagation picks the heal
-// up live. Either way kubelet, new pods and restarts are healthy immediately.
+// A running container keeps the mount it captured at start -- the dead
+// superblock, whatever its mountPropagation -- so the healed mount is then
+// grafted into every container that still holds the dead one (graft.go).
+// Kubelet, new pods and restarts are healthy immediately.
 //
 // State survives plugin restarts via a JSON file in the plugin dir (root-only,
 // same trust domain as the CSI socket — for COSI-handle volumes it carries no
@@ -53,6 +53,10 @@ type stagedVolume struct {
 	// Rewarm: the cache is walked again after every drop (cache.go): the
 	// volume's pods only read it (ReadOnlyMany).
 	Rewarm bool `json:"rewarm,omitempty"`
+	// Dead: devices (major:minor) of this volume's mounts that died while
+	// containers held them; kept until each holder has the healed mount
+	// grafted in (graft.go).
+	Dead []string `json:"dead,omitempty"`
 }
 
 type supervisor struct {
@@ -130,6 +134,7 @@ func (s *supervisor) recordStage(volumeID, stagePath string, volumeContext, secr
 		Rewarm: rewarm}
 	if prev != nil {
 		v.Publishes = prev.Publishes
+		v.Dead = prev.Dead
 	}
 	s.vols[volumeID] = v
 	s.persist()
@@ -188,6 +193,10 @@ func (s *supervisor) run(ctx context.Context) {
 	glog.Infof("supervisor: checking staged mounts every %s", s.interval)
 	s.discover(ctx)
 	s.ensureWatches()
+	// a restarted plugin finds the mounts of its predecessor's mounters dead:
+	// heal them now, not one interval later.
+	s.checkAll(ctx)
+	s.graftHolders()
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
 	n := 0
@@ -201,6 +210,7 @@ func (s *supervisor) run(ctx context.Context) {
 				s.ensureWatches()
 			}
 			s.checkAll(ctx)
+			s.graftHolders() // the grafts that failed before
 		}
 	}
 }
@@ -398,8 +408,10 @@ func lazyUnmount(path string) {
 	}
 }
 
-// heal replaces a dead staging mount and its publish binds.
+// heal replaces a dead staging mount and its publish binds, then grafts the
+// new mount into the containers that hold the dead one.
 func (s *supervisor) heal(ctx context.Context, v *stagedVolume) {
+	dev := mountDevice("/proc/self/mountinfo", v.StagePath) // the corpse, before it is detached
 	// publish binds reference the dead superblock — detach them first.
 	for _, t := range v.Publishes {
 		lazyUnmount(t)
@@ -421,4 +433,6 @@ func (s *supervisor) heal(ctx context.Context, v *stagedVolume) {
 		glog.Infof("supervisor: re-bound %s", t)
 	}
 	glog.Infof("supervisor: volume %s healed at %s", v.VolumeID, v.StagePath)
+	s.markDead(v.VolumeID, dev)
+	s.graftHolders()
 }

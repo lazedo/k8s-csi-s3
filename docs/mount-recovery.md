@@ -36,34 +36,52 @@ This fully repairs the **host-side** mount.
 Whether a *running* container sees the Layer-1 heal depends on its
 `mountPropagation`:
 
-- **`HostToContainer`** (`rslave`): host remounts under the volume path
-  propagate into the running container live — the heal is transparent.
-  **Recommended for every csi-s3 consumer that writes durable data.**
+- **`HostToContainer`** (`rslave`): mounts the host makes on top of the
+  captured mount propagate into the running container live — but Layer 1's
+  detach-and-rebind is not one of those (see below).
 - **`None`** (the default, private): the container captured the mount at
   start and never sees a host remount. New pods / restarts are fine (they get
   the healthy mount); the already-running container stays broken. For those,
   Layer 3.
 
-## Layer 3 — graft the heal into a private-propagation container (no restart)
+Measured 2026-10-09 (the lab below): Layer 1's heal — detach the dead binds,
+remount, bind again at the same paths — reaches **no** running container,
+`HostToContainer` included: each keeps the dead mount it captured. Layer 3
+covers every container whatever its propagation.
+
+## Layer 3 — the supervisor grafts the heal into running containers (no restart)
+
+After a heal (Layer 1, or the NodeStage/NodePublish paths that remount a dead
+staging), the supervisor remembers the dead superblock's device (`dead` in
+`supervisor-state.json`), reads `/proc/*/mountinfo` of the node's processes —
+the node plugin runs with **`hostPID: true`** — and, for every mount namespace
+other than the node's and its own that still holds that device, grafts the
+healed staging mount (plus the mount's subPath root) over each such mount
+point with `/usr/bin/nsmount-heal`, keeping its `ro`/`nosuid`/`nodev`/`noexec`
+flags. A graft that fails is retried every interval; the device is forgotten
+once no container holds it. A restarted plugin heals at startup, not one
+interval later. Code: `pkg/driver/graft.go`.
 
 `cmd/nsmount-heal` (C — `setns(CLONE_NEWNS)` rejects a multithreaded caller,
-so this cannot be Go) grafts a healthy mount subtree onto the dead path
-*inside a running container's mount namespace*:
+so this cannot be Go; built static into the image) grafts a healthy mount
+subtree onto the dead path *inside a running container's mount namespace*:
 
-    nsmount-heal <container-pid> <host-source-path> <container-target-path>
+    nsmount-heal <container-pid> <source-path> <container-target-path> [ro,nosuid,nodev,noexec]
 
 Mechanism:
 
 1. `open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)` clones the healthy source into a
-   **detached** mount fd. The caller's own namespace must already see the
-   healthy source — run it from a helper pod that bind-mounts
-   `/var/lib/kubelet` with `HostToContainer`, so the freshly-remounted
-   staging tree propagates in.
-2. `setns(container mnt ns)` — the only namespace switch, single-threaded.
-3. `umount2(target, MNT_DETACH)` drops the corpse, `move_mount(cloneFD, "",
+   **detached** mount fd. The caller's own namespace must see the healthy
+   source — the supervisor mounted it itself; by hand, run it from a helper
+   pod that bind-mounts `/var/lib/kubelet` with `HostToContainer`, so the
+   freshly-remounted staging tree propagates in.
+2. `mount_setattr` gives the clone the flags of the mount it replaces.
+3. `setns(container mnt ns)` — the only namespace switch, single-threaded.
+4. `umount2(target, MNT_DETACH)` drops the corpse, `move_mount(cloneFD, "",
    target, MOVE_MOUNT_F_EMPTY_PATH)` grafts the clone over it.
 
-Helper pod (privileged + hostPID, pinned to the node):
+By hand (the supervisor does all of this itself), from a helper pod
+(privileged + hostPID, pinned to the node):
 
 ```yaml
 apiVersion: v1
@@ -92,9 +110,16 @@ Proven 2026-08-18 against freeswitch media-capture: a geesefs OOM left
 `/var/run/freeswitch/capture` at `ENOTCONN`; the graft made it readable and
 writable in place with zero restart.
 
-**Roadmap**: fold Layer 3 into the supervisor — a privileged hostPID helper
-per node that the supervisor invokes for consumers on private propagation,
-after it heals the host mount in Layer 1.
+The lab (`pkg/driver/lab_reconnect_test.go`, build tag `lab`) runs the real
+NodeStage/NodePublish against a bucket, binds the volume into two running
+private-namespace "containers" (one read-only), kills the mounter as a plugin
+restart does, and has a new driver on the same state file heal and graft:
+both read again, the read-write one writes to the bucket, the read-only one
+stays read-only. Root, FUSE, geesefs and nsmount-heal needed:
+
+    go test -c -tags lab -o driver.test ./pkg/driver
+    LAB_S3_ENDPOINT=… LAB_S3_BUCKET=… LAB_S3_KEY=… LAB_S3_SECRET=… \
+      ./driver.test -test.run TestLabReconnect -test.v
 
 ## What writers should still do
 
