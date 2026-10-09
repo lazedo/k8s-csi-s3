@@ -96,11 +96,14 @@ func fuseMount(path string, command string, args []string, envs []string) error 
 	return waitForMount(path, 10*time.Second)
 }
 
+// Unmount unpublishes path: it unmounts it while it still is a mount (a dead
+// FUSE endpoint included) and removes the directory. A path that is gone or
+// no longer mounted is already unpublished -- CSI requires NodeUnpublishVolume
+// to be idempotent, and the kubelet retries a failure forever: a blind umount
+// of an orphaned pod's mount dir that had gone away kept two nodes retrying
+// every two minutes for weeks.
 func Unmount(path string) error {
-	if err := mount.New("").Unmount(path); err != nil {
-		return err
-	}
-	return nil
+	return mount.CleanupMountPoint(path, mount.New(""), true)
 }
 
 func SystemdUnmount(volumeID string) (bool, error) {
